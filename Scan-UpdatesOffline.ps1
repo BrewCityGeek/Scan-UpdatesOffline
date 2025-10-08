@@ -101,30 +101,43 @@ Add-Content -Path $LogFile -Value ""
 
 # === Begin update scan logic ===
 try {
-    $UpdateSession = New-Object -ComObject Microsoft.Update.Session
-    $UpdateServiceManager  = New-Object -ComObject Microsoft.Update.ServiceManager
-    $UpdateService = $UpdateServiceManager.AddScanPackageService("Offline Sync Service", $WsusCab, 1)
-    $UpdateSearcher = $UpdateSession.CreateUpdateSearcher()
+    # Start the scan in a background job
+    $scanJob = Start-Job -ScriptBlock {
+        $UpdateSession = New-Object -ComObject Microsoft.Update.Session
+        $UpdateServiceManager  = New-Object -ComObject Microsoft.Update.ServiceManager
+        $UpdateService = $UpdateServiceManager.AddScanPackageService("Offline Sync Service", $using:WsusCab, 1)
+        $UpdateSearcher = $UpdateSession.CreateUpdateSearcher()
+        $UpdateSearcher.ServerSelection = 3 #ssOthers
+        $UpdateSearcher.IncludePotentiallySupersededUpdates = $true
+        $UpdateSearcher.ServiceID = $UpdateService.ServiceID
+        $UpdateSearcher.Search("IsInstalled=0")
+    }
     Write-Output "Searching for updates... `r`n" | Tee-Object -FilePath $LogFile -Append
-    $UpdateSearcher.ServerSelection = 3 #ssOthers
-    $UpdateSearcher.IncludePotentiallySupersededUpdates = $true
-    $UpdateSearcher.ServiceID = $UpdateService.ServiceID
-    $SearchResult = $UpdateSearcher.Search("IsInstalled=0")
+    # Show a busy progress bar while the scan runs
+    $i = 0
+    while ($scanJob.State -eq 'Running') {
+        Write-Progress -Activity "Scanning for updates..." -Status "Please wait" -PercentComplete (($i % 100))
+        Start-Sleep -Milliseconds 300
+        $i += 5
+    }
+    Write-Progress -Activity "Scanning for updates..." -Completed
+    # Get results
+    $SearchResult = Receive-Job $scanJob
+    Remove-Job $scanJob
     $Updates = $SearchResult.Updates
     if($Updates.Count -eq 0){
         Write-Output "There are no applicable updates." | Tee-Object -FilePath $LogFile -Append
     } else {
         Write-Output "List of applicable items on the machine when using wsusscn2.cab: `r`n" | Tee-Object -FilePath $LogFile -Append
-        $i = 0
         $total = $Updates.Count
-        foreach($Update in $Updates){
+        for ($i = 0; $i -lt $total; $i++) {
+            $Update = $Updates.Item($i)
             $percent = [int]((($i+1)/[double]$total)*100)
-            Write-Progress -Activity "Scanning for updates" -Status "Processing update $($i+1) of $total" -PercentComplete $percent
+            Write-Progress -Activity "Listing updates" -Status "$($i+1) of $total" -PercentComplete $percent
             Write-Host ("{0}> {1}" -f ($i+1), $Update.Title)
             Write-Output ("{0}> {1}" -f ($i+1), $Update.Title) | Tee-Object -FilePath $LogFile -Append
-            $i++
         }
-        Write-Progress -Activity "Scanning for updates" -Completed
+        Write-Progress -Activity "Listing updates" -Completed
     }
     $exitCode = 0
 } catch {
