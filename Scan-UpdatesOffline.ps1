@@ -23,43 +23,54 @@ function Format-TimeSpan {
     return ('{0:00}:{1:00}:{2:00}' -f [int]$ts.TotalHours, $ts.Minutes, $ts.Seconds)
 }
 
-function Download-File {
-    param(
-        [string]$Url,
-        [string]$OutFile
-    )
-    # Run Invoke-WebRequest in a background job and show a spinner while it downloads.
-    $job = Start-Job -ScriptBlock { param($u,$o) Invoke-WebRequest -Uri $u -OutFile $o } -ArgumentList $Url, $OutFile
-    $spinner = "|/-\"
-    $i = 0
-    while ($job.State -eq 'Running') {
-        $char = $spinner[$i % $spinner.Length]
-        Write-Progress -Activity "Downloading wsusscn2.cab" -Status "Downloading... $char" -PercentComplete 0
-        Start-Sleep -Milliseconds 200
-        $i++
+
+# CAB hash validation helper
+function Get-FileHashString {
+    param([string]$Path)
+    if (Test-Path $Path) {
+        return (Get-FileHash -Path $Path -Algorithm SHA256).Hash.ToUpper()
+    } else {
+        return $null
     }
-    # Capture any errors and complete progress
-    Receive-Job $job -ErrorAction SilentlyContinue | Out-Null
-    $jobState = $job.State
-    Remove-Job $job -Force
-    Write-Progress -Activity "Downloading wsusscn2.cab" -Completed
-    return (Test-Path $OutFile)
 }
+
+# Optionally set this to the expected SHA256 hash of wsusscn2.cab
+$ExpectedCabHash = $null  # e.g. 'ABCDEF123456...'
+
 
 
 Write-Host "Scan running. Check the log file at $LogFile once this window closes....."
 
 
-# Always prompt to download a fresh wsusscn2.cab
+# Always prompt to download a fresh wsusscn2.cab, with strict Y/N validation
+function Read-YesNo($Prompt) {
+    while ($true) {
+        $resp = Read-Host $Prompt
+        if ($resp -match '^[YyNn]$') { return $resp.ToUpper() }
+        Write-Host "Please enter Y or N."
+    }
+}
 if (Test-Path $WsusCab) {
     Write-Host "wsusscn2.cab found at $WsusCab."
-    $download = Read-Host "Do you want to download a fresh copy now? (Y/N)"
-    if ($download -eq 'Y' -or $download -eq 'y') {
+    $download = Read-YesNo "Do you want to download a fresh copy now? (Y/N)"
+    if ($download -eq 'Y') {
         Write-Host "Downloading wsusscn2.cab from $WsusUrl ..."
-            try {
+        try {
             Invoke-WebRequest -Uri $WsusUrl -OutFile $WsusCab
             if (Test-Path $WsusCab) {
-                Write-Host "Download successful."
+                $actualHash = Get-FileHashString $WsusCab
+                if ($ExpectedCabHash) {
+                    if ($actualHash -eq $ExpectedCabHash.ToUpper()) {
+                        Write-Host "Download successful. Hash matches: $actualHash"
+                    } else {
+                        Write-Error "Download hash mismatch! Expected: $ExpectedCabHash, Got: $actualHash"
+                        Remove-Item $WsusCab -Force -ErrorAction SilentlyContinue
+                        exit 6
+                    }
+                } else {
+                    Write-Host "Download successful. SHA256: $actualHash"
+                    Write-Host "(Set $ExpectedCabHash in the script to enforce hash validation.)"
+                }
             } else {
                 Write-Error "Download failed. Please download manually from: $WsusUrl"
                 exit 4
@@ -71,13 +82,25 @@ if (Test-Path $WsusCab) {
     }
 } else {
     Write-Warning "wsusscn2.cab not found at $WsusCab."
-    $download = Read-Host "Do you want to download a new copy now? (Y/N)"
-    if ($download -eq 'Y' -or $download -eq 'y') {
+    $download = Read-YesNo "Do you want to download a new copy now? (Y/N)"
+    if ($download -eq 'Y') {
         Write-Host "Downloading wsusscn2.cab from $WsusUrl ..."
-            try {
+        try {
             Invoke-WebRequest -Uri $WsusUrl -OutFile $WsusCab
             if (Test-Path $WsusCab) {
-                Write-Host "Download successful."
+                $actualHash = Get-FileHashString $WsusCab
+                if ($ExpectedCabHash) {
+                    if ($actualHash -eq $ExpectedCabHash.ToUpper()) {
+                        Write-Host "Download successful. Hash matches: $actualHash"
+                    } else {
+                        Write-Error "Download hash mismatch! Expected: $ExpectedCabHash, Got: $actualHash"
+                        Remove-Item $WsusCab -Force -ErrorAction SilentlyContinue
+                        exit 6
+                    }
+                } else {
+                    Write-Host "Download successful. SHA256: $actualHash"
+                    Write-Host "(Set $ExpectedCabHash in the script to enforce hash validation.)"
+                }
             } else {
                 Write-Error "Download failed. Please download manually from: $WsusUrl"
                 exit 4
@@ -101,48 +124,68 @@ Add-Content -Path $LogFile -Value ""
 
 # === Begin update scan logic ===
 try {
-    # Start the scan in a background job
-    $scanJob = Start-Job -ScriptBlock {
-        $UpdateSession = New-Object -ComObject Microsoft.Update.Session
-        $UpdateServiceManager  = New-Object -ComObject Microsoft.Update.ServiceManager
-        $UpdateService = $UpdateServiceManager.AddScanPackageService("Offline Sync Service", $using:WsusCab, 1)
-        $UpdateSearcher = $UpdateSession.CreateUpdateSearcher()
-        $UpdateSearcher.ServerSelection = 3 #ssOthers
-        $UpdateSearcher.IncludePotentiallySupersededUpdates = $true
-        $UpdateSearcher.ServiceID = $UpdateService.ServiceID
-        $UpdateSearcher.Search("IsInstalled=0")
-    }
-    Write-Output "Searching for updates... `r`n" | Tee-Object -FilePath $LogFile -Append
-    # Show a busy progress bar while the scan runs
-    $i = 0
-    while ($scanJob.State -eq 'Running') {
-        Write-Progress -Activity "Scanning for updates..." -Status "Please wait" -PercentComplete (($i % 100))
-        Start-Sleep -Milliseconds 300
-        $i += 5
-    }
-    Write-Progress -Activity "Scanning for updates..." -Completed
-    # Get results
-    $SearchResult = Receive-Job $scanJob
-    Remove-Job $scanJob
-    $Updates = $SearchResult.Updates
-    if($Updates.Count -eq 0){
-        Write-Output "There are no applicable updates." | Tee-Object -FilePath $LogFile -Append
-    } else {
-        Write-Output "List of applicable items on the machine when using wsusscn2.cab: `r`n" | Tee-Object -FilePath $LogFile -Append
-        $total = $Updates.Count
-        for ($i = 0; $i -lt $total; $i++) {
-            $Update = $Updates.Item($i)
-            $percent = [int]((($i+1)/[double]$total)*100)
-            Write-Progress -Activity "Listing updates" -Status "$($i+1) of $total" -PercentComplete $percent
-            Write-Host ("{0}> {1}" -f ($i+1), $Update.Title)
-            Write-Output ("{0}> {1}" -f ($i+1), $Update.Title) | Tee-Object -FilePath $LogFile -Append
+    $scanJob = $null
+    try {
+        # Start the scan in a background job
+        $scanJob = Start-Job -ScriptBlock {
+            $UpdateSession = $null
+            $UpdateServiceManager = $null
+            $UpdateService = $null
+            $UpdateSearcher = $null
+            try {
+                $UpdateSession = New-Object -ComObject Microsoft.Update.Session
+                $UpdateServiceManager  = New-Object -ComObject Microsoft.Update.ServiceManager
+                $UpdateService = $UpdateServiceManager.AddScanPackageService("Offline Sync Service", $using:WsusCab, 1)
+                $UpdateSearcher = $UpdateSession.CreateUpdateSearcher()
+                $UpdateSearcher.ServerSelection = 3 #ssOthers
+                $UpdateSearcher.IncludePotentiallySupersededUpdates = $true
+                $UpdateSearcher.ServiceID = $UpdateService.ServiceID
+                $result = $UpdateSearcher.Search("IsInstalled=0")
+            } finally {
+                foreach ($obj in @($UpdateSearcher, $UpdateService, $UpdateServiceManager, $UpdateSession)) {
+                    if ($null -ne $obj) {
+                        try { [System.Runtime.InteropServices.Marshal]::ReleaseComObject($obj) | Out-Null } catch {}
+                    }
+                }
+            }
+            return $result
         }
-        Write-Progress -Activity "Listing updates" -Completed
+        Write-Output "Searching for updates... `r`n" | Tee-Object -FilePath $LogFile -Append
+        # Show a busy progress bar while the scan runs
+        $i = 0
+        while ($scanJob.State -eq 'Running') {
+            Write-Progress -Activity "Scanning for updates..." -Status "Please wait" -PercentComplete (($i % 100))
+            Start-Sleep -Milliseconds 300
+            $i += 5
+        }
+        Write-Progress -Activity "Scanning for updates..." -Completed
+        if ($scanJob.State -ne 'Completed') {
+            $jobError = $scanJob.ChildJobs[0].JobStateInfo.Reason
+            throw "Scan job failed: $jobError"
+        }
+        $SearchResult = Receive-Job $scanJob
+        $Updates = $SearchResult.Updates
+        if($Updates.Count -eq 0){
+            Write-Output "There are no applicable updates." | Tee-Object -FilePath $LogFile -Append
+        } else {
+            Write-Output "List of applicable items on the machine when using wsusscn2.cab: `r`n" | Tee-Object -FilePath $LogFile -Append
+            $total = $Updates.Count
+            for ($i = 0; $i -lt $total; $i++) {
+                $Update = $Updates.Item($i)
+                $percent = [int]((($i+1)/[double]$total)*100)
+                Write-Progress -Activity "Listing updates" -Status "$($i+1) of $total" -PercentComplete $percent
+                Write-Host ("{0}> {1}" -f ($i+1), $Update.Title)
+                Write-Output ("{0}> {1}" -f ($i+1), $Update.Title) | Tee-Object -FilePath $LogFile -Append
+            }
+            Write-Progress -Activity "Listing updates" -Completed
+        }
+        $exitCode = 0
+    } finally {
+        if ($scanJob) { Remove-Job $scanJob -Force -ErrorAction SilentlyContinue }
     }
-    $exitCode = 0
 } catch {
-    Write-Error "Update scan failed: $_"
-    Add-Content -Path $LogFile -Value "Update scan failed: $_"
+    Write-Error "Update scan failed: $($_.Exception.Message)"
+    Add-Content -Path $LogFile -Value "Update scan failed: $($_.Exception.Message)`n$($_.ScriptStackTrace)"
     $exitCode = 1
 }
 # === End update scan logic ===
