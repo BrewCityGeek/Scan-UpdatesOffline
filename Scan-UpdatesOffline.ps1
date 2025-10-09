@@ -3,6 +3,9 @@
 $LogFile = "C:\scripts\ScanReport.txt"
 $WsusCab = "C:\scripts\wsusscn2.cab"
 $WsusUrl = "http://go.microsoft.com/fwlink/p/?LinkID=74689"
+$WsusUrlBackup = "https://download.microsoft.com/download/9/3/9/939A4A46-91B6-4276-BC5F-9C9FF69B7DA2/wsusscn2.cab"
+$WsusUrlBackup2 = "http://download.windowsupdate.com/microsoftupdate/v6/wsusscan/wsusscn2.cab"
+# --- IGNORE ---
 
 # Fail fast if not running elevated
 try {
@@ -37,6 +40,52 @@ function Get-FileHashString {
 # Optionally set this to the expected SHA256 hash of wsusscn2.cab
 $ExpectedCabHash = $null  # e.g. 'ABCDEF123456...'
 
+# Download helper with fallback URLs
+function Download-WsusCab {
+    param(
+        [string[]]$Urls,
+        [string]$OutputPath,
+        [string]$ExpectedHash = $null
+    )
+    
+    foreach ($url in $Urls) {
+        Write-Host "Attempting download from: $url"
+        try {
+            Invoke-WebRequest -Uri $url -OutFile $OutputPath -TimeoutSec 60
+            if (Test-Path $OutputPath) {
+                $actualHash = Get-FileHashString $OutputPath
+                if ($ExpectedHash) {
+                    if ($actualHash -eq $ExpectedHash.ToUpper()) {
+                        Write-Host "Download successful. Hash matches: $actualHash"
+                        return $true
+                    } else {
+                        Write-Warning "Download hash mismatch from $url! Expected: $ExpectedHash, Got: $actualHash"
+                        Remove-Item $OutputPath -Force -ErrorAction SilentlyContinue
+                        continue  # Try next URL
+                    }
+                } else {
+                    Write-Host "Download successful from $url. SHA256: $actualHash"
+                    Write-Host "(Set `$ExpectedCabHash in the script to enforce hash validation.)"
+                    return $true
+                }
+            } else {
+                Write-Warning "Download from $url completed but file not found at $OutputPath"
+                continue
+            }
+        } catch {
+            Write-Warning "Download failed from $url`: $($_.Exception.Message)"
+            Remove-Item $OutputPath -Force -ErrorAction SilentlyContinue
+            continue
+        }
+    }
+    
+    Write-Error "All download URLs failed. Please download manually from one of these URLs:"
+    foreach ($url in $Urls) {
+        Write-Host "  - $url"
+    }
+    return $false
+}
+
 
 
 Write-Host "Scan running. Check the log file at $LogFile once this window closes....."
@@ -47,36 +96,16 @@ function Read-YesNo($Prompt) {
     while ($true) {
         $resp = Read-Host $Prompt
         if ($resp -match '^[YyNn]$') { return $resp.ToUpper() }
-        Write-Host "Please enter Y or N."
+        Write-Host "Please enter Y, or N."
     }
 }
 if (Test-Path $WsusCab) {
     Write-Host "wsusscn2.cab found at $WsusCab."
     $download = Read-YesNo "Do you want to download a fresh copy now? (Y/N)"
     if ($download -eq 'Y') {
-        Write-Host "Downloading wsusscn2.cab from $WsusUrl ..."
-        try {
-            Invoke-WebRequest -Uri $WsusUrl -OutFile $WsusCab
-            if (Test-Path $WsusCab) {
-                $actualHash = Get-FileHashString $WsusCab
-                if ($ExpectedCabHash) {
-                    if ($actualHash -eq $ExpectedCabHash.ToUpper()) {
-                        Write-Host "Download successful. Hash matches: $actualHash"
-                    } else {
-                        Write-Error "Download hash mismatch! Expected: $ExpectedCabHash, Got: $actualHash"
-                        Remove-Item $WsusCab -Force -ErrorAction SilentlyContinue
-                        exit 6
-                    }
-                } else {
-                    Write-Host "Download successful. SHA256: $actualHash"
-                    Write-Host "(Set $ExpectedCabHash in the script to enforce hash validation.)"
-                }
-            } else {
-                Write-Error "Download failed. Please download manually from: $WsusUrl"
-                exit 4
-            }
-        } catch {
-            Write-Error "Download failed. Please download manually from: $WsusUrl"
+        Write-Host "Downloading wsusscn2.cab with fallback URLs..."
+        $urls = @($WsusUrl, $WsusUrlBackup, $WsusUrlBackup2)
+        if (-not (Download-WsusCab -Urls $urls -OutputPath $WsusCab -ExpectedHash $ExpectedCabHash)) {
             exit 4
         }
     }
@@ -84,29 +113,9 @@ if (Test-Path $WsusCab) {
     Write-Warning "wsusscn2.cab not found at $WsusCab."
     $download = Read-YesNo "Do you want to download a new copy now? (Y/N)"
     if ($download -eq 'Y') {
-        Write-Host "Downloading wsusscn2.cab from $WsusUrl ..."
-        try {
-            Invoke-WebRequest -Uri $WsusUrl -OutFile $WsusCab
-            if (Test-Path $WsusCab) {
-                $actualHash = Get-FileHashString $WsusCab
-                if ($ExpectedCabHash) {
-                    if ($actualHash -eq $ExpectedCabHash.ToUpper()) {
-                        Write-Host "Download successful. Hash matches: $actualHash"
-                    } else {
-                        Write-Error "Download hash mismatch! Expected: $ExpectedCabHash, Got: $actualHash"
-                        Remove-Item $WsusCab -Force -ErrorAction SilentlyContinue
-                        exit 6
-                    }
-                } else {
-                    Write-Host "Download successful. SHA256: $actualHash"
-                    Write-Host "(Set $ExpectedCabHash in the script to enforce hash validation.)"
-                }
-            } else {
-                Write-Error "Download failed. Please download manually from: $WsusUrl"
-                exit 4
-            }
-        } catch {
-            Write-Error "Download failed. Please download manually from: $WsusUrl"
+        Write-Host "Downloading wsusscn2.cab with fallback URLs..."
+        $urls = @($WsusUrl, $WsusUrlBackup)
+        if (-not (Download-WsusCab -Urls $urls -OutputPath $WsusCab -ExpectedHash $ExpectedCabHash)) {
             exit 4
         }
     } else {
