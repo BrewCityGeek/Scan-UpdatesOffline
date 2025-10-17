@@ -1,7 +1,9 @@
 
 # PowerShell version of Scan-UpdatesOffline.bat logic, with update scan
-$LogFile = "C:\scripts\ScanReport.txt"
-$WsusCab = "C:\scripts\wsusscn2.cab"
+# Get the directory where this script is located
+$ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
+$LogFile = Join-Path $ScriptDir "ScanReport.txt"
+$WsusCab = Join-Path $ScriptDir "wsusscn2.cab"
 $WsusUrl = "http://go.microsoft.com/fwlink/p/?LinkID=74689"
 $WsusUrlBackup = "https://download.microsoft.com/download/9/3/9/939A4A46-91B6-4276-BC5F-9C9FF69B7DA2/wsusscn2.cab"
 $WsusUrlBackup2 = "http://download.windowsupdate.com/microsoftupdate/v6/wsusscan/wsusscn2.cab"
@@ -41,7 +43,7 @@ function Get-FileHashString {
 $ExpectedCabHash = $null  # e.g. 'ABCDEF123456...'
 
 # Download helper with fallback URLs
-function Download-WsusCab {
+function Get-WsusCab {
     param(
         [string[]]$Urls,
         [string]$OutputPath,
@@ -105,7 +107,7 @@ if (Test-Path $WsusCab) {
     if ($download -eq 'Y') {
         Write-Host "Downloading wsusscn2.cab with fallback URLs..."
         $urls = @($WsusUrl, $WsusUrlBackup, $WsusUrlBackup2)
-        if (-not (Download-WsusCab -Urls $urls -OutputPath $WsusCab -ExpectedHash $ExpectedCabHash)) {
+        if (-not (Get-WsusCab -Urls $urls -OutputPath $WsusCab -ExpectedHash $ExpectedCabHash)) {
             exit 4
         }
     }
@@ -114,8 +116,8 @@ if (Test-Path $WsusCab) {
     $download = Read-YesNo "Do you want to download a new copy now? (Y/N)"
     if ($download -eq 'Y') {
         Write-Host "Downloading wsusscn2.cab with fallback URLs..."
-        $urls = @($WsusUrl, $WsusUrlBackup)
-        if (-not (Download-WsusCab -Urls $urls -OutputPath $WsusCab -ExpectedHash $ExpectedCabHash)) {
+        $urls = @($WsusUrl, $WsusUrlBackup, $WsusUrlBackup2)
+        if (-not (Get-WsusCab -Urls $urls -OutputPath $WsusCab -ExpectedHash $ExpectedCabHash)) {
             exit 4
         }
     } else {
@@ -133,48 +135,29 @@ Add-Content -Path $LogFile -Value ""
 
 # === Begin update scan logic ===
 try {
-    $scanJob = $null
+    Write-Output "Searching for updates... `r`n" | Tee-Object -FilePath $LogFile -Append
+    
+    $UpdateSession = $null
+    $UpdateServiceManager = $null
+    $UpdateService = $null
+    $UpdateSearcher = $null
+    $SearchResult = $null
+    
     try {
-        # Start the scan in a background job
-        $scanJob = Start-Job -ScriptBlock {
-            $UpdateSession = $null
-            $UpdateServiceManager = $null
-            $UpdateService = $null
-            $UpdateSearcher = $null
-            try {
-                $UpdateSession = New-Object -ComObject Microsoft.Update.Session
-                $UpdateServiceManager  = New-Object -ComObject Microsoft.Update.ServiceManager
-                $UpdateService = $UpdateServiceManager.AddScanPackageService("Offline Sync Service", $using:WsusCab, 1)
-                $UpdateSearcher = $UpdateSession.CreateUpdateSearcher()
-                $UpdateSearcher.ServerSelection = 3 #ssOthers
-                $UpdateSearcher.IncludePotentiallySupersededUpdates = $true
-                $UpdateSearcher.ServiceID = $UpdateService.ServiceID
-                $result = $UpdateSearcher.Search("IsInstalled=0")
-            } finally {
-                foreach ($obj in @($UpdateSearcher, $UpdateService, $UpdateServiceManager, $UpdateSession)) {
-                    if ($null -ne $obj) {
-                        try { [System.Runtime.InteropServices.Marshal]::ReleaseComObject($obj) | Out-Null } catch {}
-                    }
-                }
-            }
-            return $result
-        }
-        Write-Output "Searching for updates... `r`n" | Tee-Object -FilePath $LogFile -Append
-        # Show a busy progress bar while the scan runs
-        $i = 0
-        while ($scanJob.State -eq 'Running') {
-            Write-Progress -Activity "Scanning for updates..." -Status "Please wait" -PercentComplete (($i % 100))
-            Start-Sleep -Milliseconds 300
-            $i += 5
-        }
-        Write-Progress -Activity "Scanning for updates..." -Completed
-        if ($scanJob.State -ne 'Completed') {
-            $jobError = $scanJob.ChildJobs[0].JobStateInfo.Reason
-            throw "Scan job failed: $jobError"
-        }
-        $SearchResult = Receive-Job $scanJob
+        # Create COM objects and perform the scan
+        $UpdateSession = New-Object -ComObject Microsoft.Update.Session
+        $UpdateServiceManager = New-Object -ComObject Microsoft.Update.ServiceManager
+        $UpdateService = $UpdateServiceManager.AddScanPackageService("Offline Sync Service", $WsusCab, 1)
+        $UpdateSearcher = $UpdateSession.CreateUpdateSearcher()
+        $UpdateSearcher.ServerSelection = 3 # ssOthers
+        $UpdateSearcher.IncludePotentiallySupersededUpdates = $true
+        $UpdateSearcher.ServiceID = $UpdateService.ServiceID
+        
+        # Perform the search
+        $SearchResult = $UpdateSearcher.Search("IsInstalled=0")
         $Updates = $SearchResult.Updates
-        if($Updates.Count -eq 0){
+        
+        if ($Updates.Count -eq 0) {
             Write-Output "There are no applicable updates." | Tee-Object -FilePath $LogFile -Append
         } else {
             Write-Output "List of applicable items on the machine when using wsusscn2.cab: `r`n" | Tee-Object -FilePath $LogFile -Append
@@ -190,7 +173,12 @@ try {
         }
         $exitCode = 0
     } finally {
-        if ($scanJob) { Remove-Job $scanJob -Force -ErrorAction SilentlyContinue }
+        # Clean up COM objects
+        foreach ($obj in @($SearchResult, $UpdateSearcher, $UpdateService, $UpdateServiceManager, $UpdateSession)) {
+            if ($null -ne $obj) {
+                try { [System.Runtime.InteropServices.Marshal]::ReleaseComObject($obj) | Out-Null } catch {}
+            }
+        }
     }
 } catch {
     Write-Error "Update scan failed: $($_.Exception.Message)"
